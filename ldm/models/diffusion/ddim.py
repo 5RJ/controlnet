@@ -82,6 +82,7 @@ class DDIMSampler(object):
                 ctmp = conditioning[list(conditioning.keys())[0]]
                 while isinstance(ctmp, list): ctmp = ctmp[0]
                 cbs = ctmp.shape[0]
+                # cbs = len(ctmp[0])
                 if cbs != batch_size:
                     print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
 
@@ -140,8 +141,8 @@ class DDIMSampler(object):
             subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
             timesteps = self.ddim_timesteps[:subset_end]
 
-        intermediates = {'x_inter': [img], 'pred_x0': [img]}
-        time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
+        intermediates = {'x_inter': [img], 'pred_x0': [img], "index": [10000]}
+        time_range = reversed(range(0, timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         print(f"Running DDIM Sampling with {total_steps} timesteps")
 
@@ -168,12 +169,15 @@ class DDIMSampler(object):
                                       unconditional_conditioning=unconditional_conditioning,
                                       dynamic_threshold=dynamic_threshold)
             img, pred_x0 = outs
-            if callback: callback(i)
-            if img_callback: img_callback(pred_x0, i)
+            if callback:
+                callback(i)
+            if img_callback:
+                img_callback(pred_x0, i)
 
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
+                intermediates['index'].append(index)
 
         return img, intermediates
 
@@ -197,6 +201,20 @@ class DDIMSampler(object):
                         c_in[k] = [torch.cat([
                             unconditional_conditioning[k][i],
                             c[k][i]]) for i in range(len(c[k]))]
+                    elif isinstance(c[k], dict):
+                        c_in[k] = dict()
+                        for key in c[k]:
+                            if isinstance(c[k][key], list):
+                                if not isinstance(c[k][key][0], torch.Tensor):
+                                    continue
+                                c_in[k][key] = [torch.cat([
+                                    unconditional_conditioning[k][key][i],
+                                    c[k][key][i]]) for i in range(len(c[k][key]))]
+                            else:
+                                c_in[k][key] = torch.cat([
+                                    unconditional_conditioning[k][key],
+                                    c[k][key]])
+
                     else:
                         c_in[k] = torch.cat([
                                 unconditional_conditioning[k],

@@ -2,6 +2,8 @@ import einops
 import torch
 import torch as th
 import torch.nn as nn
+import copy
+from easydict import EasyDict as edict
 
 from ldm.modules.diffusionmodules.util import (
     conv_nd,
@@ -16,7 +18,14 @@ from ldm.modules.attention import SpatialTransformer
 from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
+# from ldm.models.diffusion.ddim import DDIMSampler
+from cldm.ddim_hacked import DDIMSampler
+from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
+from .recognizer import TextRecognizer, create_predictor
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 class ControlledUnetModel(UNetModel):
@@ -24,6 +33,8 @@ class ControlledUnetModel(UNetModel):
         hs = []
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+            if self.use_fp16:
+                t_emb = t_emb.half()
             emb = self.time_embed(t_emb)
             h = x.type(self.dtype)
             for module in self.input_blocks:
@@ -51,7 +62,8 @@ class ControlNet(nn.Module):
             image_size,
             in_channels,
             model_channels,
-            hint_channels,
+            glyph_channels,
+            position_channels,
             num_res_blocks,
             attention_resolutions,
             dropout=0,
@@ -94,7 +106,6 @@ class ControlNet(nn.Module):
 
         if num_head_channels == -1:
             assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
-
         self.dims = dims
         self.image_size = image_size
         self.in_channels = in_channels
@@ -116,12 +127,12 @@ class ControlNet(nn.Module):
                   f"This option has LESS priority than attention_resolutions {attention_resolutions}, "
                   f"i.e., in cases where num_attention_blocks[i] > 0 but 2**i not in attention_resolutions, "
                   f"attention will still not be set.")
-
         self.attention_resolutions = attention_resolutions
         self.dropout = dropout
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.use_checkpoint = use_checkpoint
+        self.use_fp16 = use_fp16
         self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
@@ -144,8 +155,12 @@ class ControlNet(nn.Module):
         )
         self.zero_convs = nn.ModuleList([self.make_zero_conv(model_channels)])
 
-        self.input_hint_block = TimestepEmbedSequential(
-            conv_nd(dims, hint_channels, 16, 3, padding=1),
+        self.glyph_block = TimestepEmbedSequential(
+            conv_nd(dims, glyph_channels, 8, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, 8, 8, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, 8, 16, 3, padding=1, stride=2),
             nn.SiLU(),
             conv_nd(dims, 16, 16, 3, padding=1),
             nn.SiLU(),
@@ -159,8 +174,26 @@ class ControlNet(nn.Module):
             nn.SiLU(),
             conv_nd(dims, 96, 256, 3, padding=1, stride=2),
             nn.SiLU(),
-            zero_module(conv_nd(dims, 256, model_channels, 3, padding=1))
         )
+
+        self.position_block = TimestepEmbedSequential(
+            conv_nd(dims, position_channels, 8, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, 8, 8, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, 8, 16, 3, padding=1, stride=2),
+            nn.SiLU(),
+            conv_nd(dims, 16, 16, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, 16, 32, 3, padding=1, stride=2),
+            nn.SiLU(),
+            conv_nd(dims, 32, 32, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, 32, 64, 3, padding=1, stride=2),
+            nn.SiLU(),
+        )
+
+        self.fuse_block = zero_module(conv_nd(dims, 256+64+4, model_channels, 3, padding=1))
 
         self._feature_size = model_channels
         input_block_chans = [model_channels]
@@ -281,11 +314,19 @@ class ControlNet(nn.Module):
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
-    def forward(self, x, hint, timesteps, context, **kwargs):
+    def forward(self, x, hint, text_info, timesteps, context, **kwargs):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        if self.use_fp16:
+            t_emb = t_emb.half()
         emb = self.time_embed(t_emb)
 
-        guided_hint = self.input_hint_block(hint, emb, context)
+        # guided_hint from text_info
+        B, C, H, W = x.shape
+        glyphs = torch.cat(text_info['glyphs'], dim=1).sum(dim=1, keepdim=True)
+        positions = torch.cat(text_info['positions'], dim=1).sum(dim=1, keepdim=True)
+        enc_glyph = self.glyph_block(glyphs, emb, context)
+        enc_pos = self.position_block(positions, emb, context)
+        guided_hint = self.fuse_block(torch.cat([enc_glyph, enc_pos, text_info['masked_x']], dim=1))
 
         outs = []
 
@@ -307,42 +348,154 @@ class ControlNet(nn.Module):
 
 class ControlLDM(LatentDiffusion):
 
-    def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
+    def __init__(self, control_stage_config, control_key, glyph_key, position_key, only_mid_control, loss_alpha=0, loss_beta=0, with_step_weight=False, use_vae_upsample=False, latin_weight=1.0, embedding_manager_config=None, *args, **kwargs):
+        self.use_fp16 = kwargs.pop('use_fp16', False)
         super().__init__(*args, **kwargs)
         self.control_model = instantiate_from_config(control_stage_config)
         self.control_key = control_key
+        self.glyph_key = glyph_key
+        self.position_key = position_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
+        self.loss_alpha = loss_alpha
+        self.loss_beta = loss_beta
+        self.with_step_weight = with_step_weight
+        self.use_vae_upsample = use_vae_upsample
+        self.latin_weight = latin_weight
+
+        if embedding_manager_config is not None and embedding_manager_config.params.valid:
+            self.embedding_manager = self.instantiate_embedding_manager(embedding_manager_config, self.cond_stage_model)
+            for param in self.embedding_manager.embedding_parameters():
+                param.requires_grad = True
+        else:
+            self.embedding_manager = None
+        if self.loss_alpha > 0 or self.loss_beta > 0 or self.embedding_manager:
+            if embedding_manager_config.params.emb_type == 'ocr':
+                self.text_predictor = create_predictor().eval()
+                args = edict()
+                args.rec_image_shape = "3, 48, 320"
+                args.rec_batch_num = 6
+                args.rec_char_dict_path = './ocr_recog/ppocr_keys_v1.txt'
+                args.use_fp16 = self.use_fp16
+                self.cn_recognizer = TextRecognizer(args, self.text_predictor)
+                for param in self.text_predictor.parameters():
+                    param.requires_grad = False
+                if self.embedding_manager:
+                    self.embedding_manager.recog = self.cn_recognizer
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
-        control = batch[self.control_key]
+        if self.embedding_manager is None:  # fill in full caption
+            self.fill_caption(batch)
+        x, c, mx = super().get_input(batch, self.first_stage_key, mask_k='masked_img', *args, **kwargs)
+        control = batch[self.control_key]  # for log_images and loss_alpha, not real control
         if bs is not None:
             control = control[:bs]
         control = control.to(self.device)
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+
+        inv_mask = batch['inv_mask']
+        if bs is not None:
+            inv_mask = inv_mask[:bs]
+        inv_mask = inv_mask.to(self.device)
+        inv_mask = einops.rearrange(inv_mask, 'b h w c -> b c h w')
+        inv_mask = inv_mask.to(memory_format=torch.contiguous_format).float()
+
+        glyphs = batch[self.glyph_key]
+        gly_line = batch['gly_line']
+        positions = batch[self.position_key]
+        n_lines = batch['n_lines']
+        language = batch['language']
+        texts = batch['texts']
+        assert len(glyphs) == len(positions)
+        for i in range(len(glyphs)):
+            if bs is not None:
+                glyphs[i] = glyphs[i][:bs]
+                gly_line[i] = gly_line[i][:bs]
+                positions[i] = positions[i][:bs]
+                n_lines = n_lines[:bs]
+            glyphs[i] = glyphs[i].to(self.device)
+            gly_line[i] = gly_line[i].to(self.device)
+            positions[i] = positions[i].to(self.device)
+            glyphs[i] = einops.rearrange(glyphs[i], 'b h w c -> b c h w')
+            gly_line[i] = einops.rearrange(gly_line[i], 'b h w c -> b c h w')
+            positions[i] = einops.rearrange(positions[i], 'b h w c -> b c h w')
+            glyphs[i] = glyphs[i].to(memory_format=torch.contiguous_format).float()
+            gly_line[i] = gly_line[i].to(memory_format=torch.contiguous_format).float()
+            positions[i] = positions[i].to(memory_format=torch.contiguous_format).float()
+        info = {}
+        info['glyphs'] = glyphs
+        info['positions'] = positions
+        info['n_lines'] = n_lines
+        info['language'] = language
+        info['texts'] = texts
+        info['img'] = batch['img']  # nhwc, (-1,1)
+        info['masked_x'] = mx
+        info['gly_line'] = gly_line
+        info['inv_mask'] = inv_mask
+        return x, dict(c_crossattn=[c], c_concat=[control], text_info=info)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
-
-        cond_txt = torch.cat(cond['c_crossattn'], 1)
-
-        if cond['c_concat'] is None:
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
-        else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+        _cond = torch.cat(cond['c_crossattn'], 1)
+        _hint = torch.cat(cond['c_concat'], 1)
+        if self.use_fp16:
+            x_noisy = x_noisy.half()
+        control = self.control_model(x=x_noisy, timesteps=t, context=_cond, hint=_hint, text_info=cond['text_info'])
+        control = [c * scale for c, scale in zip(control, self.control_scales)]
+        eps = diffusion_model(x=x_noisy, timesteps=t, context=_cond, control=control, only_mid_control=self.only_mid_control)
 
         return eps
 
+    def instantiate_embedding_manager(self, config, embedder):
+        model = instantiate_from_config(config, embedder=embedder)
+        return model
+
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
-        return self.get_learned_conditioning([""] * N)
+        return self.get_learned_conditioning(dict(c_crossattn=[[""] * N], text_info=None))
+
+    def get_learned_conditioning(self, c):
+        if self.cond_stage_forward is None:
+            if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
+                if self.embedding_manager is not None and c['text_info'] is not None:
+                    self.embedding_manager.encode_text(c['text_info'])
+                if isinstance(c, dict):
+                    cond_txt = c['c_crossattn'][0]
+                else:
+                    cond_txt = c
+                if self.embedding_manager is not None:
+                    cond_txt = self.cond_stage_model.encode(cond_txt, embedding_manager=self.embedding_manager)
+                else:
+                    cond_txt = self.cond_stage_model.encode(cond_txt)
+                if isinstance(c, dict):
+                    c['c_crossattn'][0] = cond_txt
+                else:
+                    c = cond_txt
+                if isinstance(c, DiagonalGaussianDistribution):
+                    c = c.mode()
+            else:
+                c = self.cond_stage_model(c)
+        else:
+            assert hasattr(self.cond_stage_model, self.cond_stage_forward)
+            c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
+        return c
+
+    def fill_caption(self, batch, place_holder='*'):
+        bs = len(batch['n_lines'])
+        cond_list = copy.deepcopy(batch[self.cond_stage_key])
+        for i in range(bs):
+            n_lines = batch['n_lines'][i]
+            if n_lines == 0:
+                continue
+            cur_cap = cond_list[i]
+            for j in range(n_lines):
+                r_txt = batch['texts'][j][i]
+                cur_cap = cur_cap.replace(place_holder, f'"{r_txt}"', 1)
+            cond_list[i] = cur_cap
+        batch[self.cond_stage_key] = cond_list
 
     @torch.no_grad()
     def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
@@ -354,12 +507,34 @@ class ControlLDM(LatentDiffusion):
 
         log = dict()
         z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+        if self.cond_stage_trainable:
+            with torch.no_grad():
+                c = self.get_learned_conditioning(c)
+        c_crossattn = c["c_crossattn"][0][:N]
+        c_cat = c["c_concat"][0][:N]
+        text_info = c["text_info"]
+        text_info['glyphs'] = [i[:N] for i in text_info['glyphs']]
+        text_info['gly_line'] = [i[:N] for i in text_info['gly_line']]
+        text_info['positions'] = [i[:N] for i in text_info['positions']]
+        text_info['n_lines'] = text_info['n_lines'][:N]
+        text_info['masked_x'] = text_info['masked_x'][:N]
+        text_info['img'] = text_info['img'][:N]
+
         N = min(z.shape[0], N)
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
+        log["masked_image"] = self.decode_first_stage(text_info['masked_x'])
         log["control"] = c_cat * 2.0 - 1.0
-        log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
+        log["img"] = text_info['img'].permute(0, 3, 1, 2)  # log source image if needed
+        # get glyph
+        glyph_bs = torch.stack(text_info['glyphs'])
+        glyph_bs = torch.sum(glyph_bs, dim=0) * 2.0 - 1.0
+        log["glyph"] = torch.nn.functional.interpolate(glyph_bs, size=(512, 512), mode='bilinear', align_corners=True,)
+        # fill caption
+        if not self.embedding_manager:
+            self.fill_caption(batch)
+        captions = batch[self.cond_stage_key]
+        log["conditioning"] = log_txt_as_img((512, 512), captions, size=16)
 
         if plot_diffusion_rows:
             # get diffusion row
@@ -381,7 +556,7 @@ class ControlLDM(LatentDiffusion):
 
         if sample:
             # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c], "text_info": text_info},
                                                      batch_size=N, ddim=use_ddim,
                                                      ddim_steps=ddim_steps, eta=ddim_eta)
             x_samples = self.decode_first_stage(samples)
@@ -393,15 +568,20 @@ class ControlLDM(LatentDiffusion):
         if unconditional_guidance_scale > 1.0:
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
-            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                             batch_size=N, ddim=use_ddim,
-                                             ddim_steps=ddim_steps, eta=ddim_eta,
-                                             unconditional_guidance_scale=unconditional_guidance_scale,
-                                             unconditional_conditioning=uc_full,
-                                             )
+            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross['c_crossattn'][0]], "text_info": text_info}
+            samples_cfg, tmps = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c_crossattn], "text_info": text_info},
+                                                batch_size=N, ddim=use_ddim,
+                                                ddim_steps=ddim_steps, eta=ddim_eta,
+                                                unconditional_guidance_scale=unconditional_guidance_scale,
+                                                unconditional_conditioning=uc_full,
+                                                )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
+            pred_x0 = False  # wether log pred_x0
+            if pred_x0:
+                for idx in range(len(tmps['pred_x0'])):
+                    pred_x0 = self.decode_first_stage(tmps['pred_x0'][idx])
+                    log[f"pred_x0_{tmps['index'][idx]}"] = pred_x0
 
         return log
 
@@ -410,15 +590,27 @@ class ControlLDM(LatentDiffusion):
         ddim_sampler = DDIMSampler(self)
         b, c, h, w = cond["c_concat"][0].shape
         shape = (self.channels, h // 8, w // 8)
-        samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, **kwargs)
+        samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, log_every_t=5, **kwargs)
         return samples, intermediates
 
     def configure_optimizers(self):
         lr = self.learning_rate
         params = list(self.control_model.parameters())
+        if self.embedding_manager:
+            params += list(self.embedding_manager.embedding_parameters())
         if not self.sd_locked:
+            # params += list(self.model.diffusion_model.input_blocks.parameters())
+            # params += list(self.model.diffusion_model.middle_block.parameters())
             params += list(self.model.diffusion_model.output_blocks.parameters())
             params += list(self.model.diffusion_model.out.parameters())
+        if self.unlockKV:
+            nCount = 0
+            for name, param in self.model.diffusion_model.named_parameters():
+                if 'attn2.to_k' in name or 'attn2.to_v' in name:
+                    params += [param]
+                    nCount += 1
+            print(f'Cross attention is unlocked, and {nCount} Wk or Wv are added to potimizers!!!')
+
         opt = torch.optim.AdamW(params, lr=lr)
         return opt
 

@@ -1,9 +1,5 @@
 """
-wild mixture of
-https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
-https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bbbd2d9902ce/improved_diffusion/gaussian_diffusion.py
-https://github.com/CompVis/taming-transformers
--- merci
+Part of the implementation is borrowed and modified from ControlNet, publicly available at https://github.com/lllyasviel/ControlNet/blob/main/ldm/models/diffusion/ddpm.py
 """
 
 import torch
@@ -26,11 +22,32 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from cldm.recognizer import crop_image
+import cv2
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
                          'adm': 'y'}
+
+PRINT_DEBUG = False
+
+
+def print_grad(grad):
+    # print('Gradient:', grad)
+    # print(grad.shape)
+    a = grad.max()
+    b = grad.min()
+    # print(f'mean={grad.mean():.4f}, max={a:.4f}, min={b:.4f}')
+    s = 255./(a-b)
+    c = 255*(-b/(a-b))
+    grad = grad * s + c
+    # print(f'mean={grad.mean():.4f}, max={grad.max():.4f}, min={grad.min():.4f}')
+    img = grad[0].permute(1, 2, 0).detach().cpu().numpy()
+    if img.shape[0] == 512:
+        cv2.imwrite('grad-img.jpg', img)
+    elif img.shape[0] == 64:
+        cv2.imwrite('grad-latent.jpg', img)
 
 
 def disabled_train(self, mode=True):
@@ -144,6 +161,7 @@ class DDPM(pl.LightningModule):
                                        cosine_s=cosine_s)
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
+        # np.save('1.npy', alphas_cumprod)
         alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
 
         timesteps, = betas.shape
@@ -765,13 +783,21 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
-                  cond_key=None, return_original_cond=False, bs=None, return_x=False):
+                  cond_key=None, return_original_cond=False, bs=None, return_x=False, mask_k=None):
         x = super().get_input(batch, k)
         if bs is not None:
             x = x[:bs]
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
+
+        if mask_k is not None:
+            mx = super().get_input(batch, mask_k)
+            if bs is not None:
+                mx = mx[:bs]
+            mx = mx.to(self.device)
+            encoder_posterior = self.encode_first_stage(mx)
+            mx = self.get_first_stage_encoding(encoder_posterior).detach()
 
         if self.model.conditioning_key is not None and not self.force_null_conditioning:
             if cond_key is None:
@@ -814,10 +840,22 @@ class LatentDiffusion(DDPM):
             out.extend([x])
         if return_original_cond:
             out.append(xc)
+        if mask_k:
+            out.append(mx)
         return out
 
     @torch.no_grad()
     def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
+        if predict_cids:
+            if z.dim() == 4:
+                z = torch.argmax(z.exp(), dim=1).long()
+            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
+            z = rearrange(z, 'b h w c -> b c h w').contiguous()
+
+        z = 1. / self.scale_factor * z
+        return self.first_stage_model.decode(z)
+
+    def decode_first_stage_grad(self, z, predict_cids=False, force_not_quantize=False):
         if predict_cids:
             if z.dim() == 4:
                 z = torch.argmax(z.exp(), dim=1).long()
@@ -838,6 +876,7 @@ class LatentDiffusion(DDPM):
 
     def forward(self, x, c, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        # t = torch.randint(500, 501, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
@@ -888,7 +927,7 @@ class LatentDiffusion(DDPM):
         model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
-        prefix = 'train' if self.training else 'val'
+        prefix = 't' if self.training else 'v'
 
         if self.parameterization == "x0":
             target = x_start
@@ -899,22 +938,149 @@ class LatentDiffusion(DDPM):
         else:
             raise NotImplementedError()
 
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
-        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+        loss_eps = self.get_loss(model_output, target, mean=False)
+        if True:  # block grad in invalid mask areas
+            inv_mask = cond['text_info']['inv_mask']
+            inv_mask = torch.nn.functional.interpolate(inv_mask, size=(64, 64)).repeat(1, 4, 1, 1)
+            loss_eps = loss_eps * (1 - inv_mask)
+        loss_simple = loss_eps.mean([1, 2, 3])
+        loss_dict.update({f'{prefix}/sim': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
-        loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
-        if self.learn_logvar:
-            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
-            loss_dict.update({'logvar': self.logvar.data.mean()})
+        loss_ocr = torch.zeros_like(loss_simple)
+        loss_ctc = torch.zeros_like(loss_simple)
 
-        loss = self.l_simple_weight * loss.mean()
+        if self.loss_alpha > 0 or self.loss_beta > 0:
+            self.text_predictor.eval()
+            step_weight = extract_into_tensor(self.alphas_cumprod, t, x_start.shape).reshape(len(t))
+            if not self.with_step_weight:
+                step_weight = torch.ones_like(step_weight)
+            pred_x0 = self.predict_start_from_noise(x_noisy, t, model_output)
+            if self.use_vae_upsample:
+                decode_x0 = self.decode_first_stage_grad(pred_x0)
+            else:
+                decode_x0 = torch.nn.functional.interpolate(
+                    pred_x0,
+                    size=(512, 512),
+                    mode='bilinear',
+                    align_corners=True,
+                )
+                decode_x0 = decode_x0.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+            decode_x0 = torch.clamp(decode_x0, -1, 1)
+            decode_x0 = (decode_x0 + 1.0) / 2.0 * 255  # -1,1 -> 0,255; n, c,h,w
 
-        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
-        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
-        loss += (self.original_elbo_weight * loss_vlb)
+            origin_x0 = (cond['text_info']['img'] + 1.0) / 2.0 * 255  # -1,1 -> 0,255; n,h,w,c
+            origin_x0 = rearrange(origin_x0, 'n h w c -> n c h w')
+            if PRINT_DEBUG:
+                cv2.imwrite('00.origin.jpg', origin_x0[0].permute(1, 2, 0).detach().cpu().numpy()[..., ::-1])
+                cv2.imwrite('00.decode.jpg', decode_x0[0].permute(1, 2, 0).detach().cpu().numpy()[..., ::-1])
+                decode_x0.register_hook(print_grad)
+                model_output.register_hook(print_grad)
+
+            bsz = decode_x0.shape[0]
+            bs_ocr_loss = []
+            bs_ctc_loss = []
+            recog = self.cn_recognizer
+
+            lang_weight = []
+            gt_texts = []
+            x0_texts = []
+            x0_texts_ori = []
+
+            for i in range(bsz):
+                n_lines = cond['text_info']['n_lines'][i]  # batch size
+                for j in range(n_lines):  # line
+                    lang = cond['text_info']['language'][j][i]
+                    if lang == 'Chinese':
+                        lang_weight += [1.0]
+                    elif lang == 'Latin':
+                        lang_weight += [self.latin_weight]
+                    else:
+                        lang_weight += [1.0]  # unsupport language, TODO
+                    gt_texts += [cond['text_info']['texts'][j][i]]
+                    pos = cond['text_info']['positions'][j][i]*255.
+                    pos = rearrange(pos, 'c h w -> h w c')
+                    np_pos = pos.detach().cpu().numpy().astype(np.uint8)
+                    x0_text = crop_image(decode_x0[i], np_pos)
+                    x0_texts += [x0_text]
+                    x0_text_ori = crop_image(origin_x0[i], np_pos)
+                    x0_texts_ori += [x0_text_ori]
+            if len(x0_texts) > 0:
+                x0_list = x0_texts + x0_texts_ori
+                preds, preds_neck = recog.pred_imglist(x0_list, show_debug=PRINT_DEBUG)
+                n_pairs = len(preds)//2
+                preds_decode = preds[:n_pairs]
+                preds_ori = preds[n_pairs:]
+                preds_neck_decode = preds_neck[:n_pairs]
+                preds_neck_ori = preds_neck[n_pairs:]
+                lang_weight = torch.tensor(lang_weight).to(preds_neck.device)
+                # split to batches
+                bs_preds_decode = []
+                bs_preds_ori = []
+                bs_preds_neck_decode = []
+                bs_preds_neck_ori = []
+                bs_lang_weight = []
+                bs_gt_texts = []
+                n_idx = 0
+                for i in range(bsz):  # sample index in a batch
+                    n_lines = cond['text_info']['n_lines'][i]
+                    bs_preds_decode += [preds_decode[n_idx:n_idx+n_lines]]
+                    bs_preds_ori += [preds_ori[n_idx:n_idx+n_lines]]
+                    bs_preds_neck_decode += [preds_neck_decode[n_idx:n_idx+n_lines]]
+                    bs_preds_neck_ori += [preds_neck_ori[n_idx:n_idx+n_lines]]
+                    bs_lang_weight += [lang_weight[n_idx:n_idx+n_lines]]
+                    bs_gt_texts += [gt_texts[n_idx:n_idx+n_lines]]
+                    n_idx += n_lines
+                # calc loss
+                ocr_loss_debug = []
+                ctc_loss_debug = []
+                for i in range(bsz):
+                    if len(bs_preds_neck_decode[i]) > 0:
+                        if self.loss_alpha > 0:
+                            sp_ocr_loss = self.get_loss(bs_preds_neck_decode[i], bs_preds_neck_ori[i], mean=False).mean([1, 2])
+                            sp_ocr_loss *= bs_lang_weight[i]  # weighted by language
+                            bs_ocr_loss += [sp_ocr_loss.mean()]
+                            ocr_loss_debug += sp_ocr_loss.detach().cpu().numpy().tolist()
+                        else:
+                            bs_ocr_loss += [torch.tensor(0).float().to(pred_x0.device)]
+                        if self.loss_beta > 0:
+                            sp_ctc_loss = recog.get_ctcloss(bs_preds_decode[i], bs_gt_texts[i], bs_lang_weight[i])
+                            bs_ctc_loss += [sp_ctc_loss.mean()]
+                            ctc_loss_debug += sp_ctc_loss.detach().cpu().numpy().tolist()
+                        else:
+                            bs_ctc_loss += [torch.tensor(0).float().to(pred_x0.device)]
+                    else:
+                        bs_ocr_loss += [torch.tensor(0).float().to(pred_x0.device)]
+                        bs_ctc_loss += [torch.tensor(0).float().to(pred_x0.device)]
+
+                if PRINT_DEBUG and len(preds_decode) > 0:
+                    with torch.no_grad():
+                        preds_all = preds_decode.softmax(dim=2)
+                        preds_all_ori = preds_ori.softmax(dim=2)
+                        for k in range(len(preds_all)):
+                            pred = preds_all[k]
+                            order, idx = recog.decode(pred)
+                            text = recog.get_text(order)
+                            pred_ori = preds_all_ori[k]
+                            order, idx = recog.decode(pred_ori)
+                            text_ori = recog.get_text(order)
+                            str_log = f't = {t}, pred/ori/gt="{text}"/"{text_ori}"/"{gt_texts[k]}"'
+                            if self.loss_alpha > 0:
+                                str_log += f' ocr_loss={ocr_loss_debug[k]:.4f}'
+                            if self.loss_beta > 0:
+                                str_log += f' ctc_loss={ctc_loss_debug[k]:.4f}'
+                            print(str_log)
+
+                loss_ocr += torch.stack(bs_ocr_loss) * self.loss_alpha * step_weight
+                loss_ctc += torch.stack(bs_ctc_loss) * self.loss_beta * step_weight
+                if PRINT_DEBUG:
+                    print(f'loss_ocr: {loss_ocr.mean().detach().cpu().numpy():.4f}, loss_ctc: {loss_ctc.mean().detach().cpu().numpy():.4f}, loss_simple: {loss_simple.mean().detach().cpu().numpy():.4f}, Weight: loss_alpha={self.loss_alpha}, loss_beta={self.loss_beta}, step_weight={step_weight.detach().cpu().numpy()}, latin_weight={self.latin_weight}')
+            loss_dict.update({f'{prefix}/ocr': loss_ocr.mean()})
+            loss_dict.update({f'{prefix}/ctc': loss_ctc.mean()})
+            loss_simple += loss_ocr
+            loss_simple += loss_ctc
+
+        loss = loss_simple.mean()
+
         loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
